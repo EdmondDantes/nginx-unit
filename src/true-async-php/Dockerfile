@@ -107,8 +107,10 @@ RUN ./configure php \
     && make php \
     && make php-install
 
-# ---------- 10. Verify module was built ----------
-RUN ls -la /usr/local/unit/modules/
+# ---------- 10. Copy module to correct location and verify ----------
+RUN mkdir -p /usr/local/unit/modules \
+    && cp /usr/local/lib/unit/modules/php.unit.so /usr/local/unit/modules/ \
+    && ls -la /usr/local/unit/modules/
 
 # ---------- RUNTIME STAGE ----------
 FROM ubuntu:24.04 AS runtime
@@ -146,6 +148,11 @@ ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/local/unit/sbin:$PATH"
 
 # Verify installations
 RUN php -v && /usr/local/unit/sbin/unitd --version
+
+# Verify PHP module exists
+RUN ls -la /usr/local/unit/modules/ && \
+    test -f /usr/local/unit/modules/php.unit.so || \
+    (echo "ERROR: PHP module not found!" && exit 1)
 
 # Copy example application
 COPY --from=builder /usr/src/nginx-unit/src/true-async-php/entrypoint.php /app/entrypoint.php
@@ -195,9 +202,16 @@ if [ ! -S /var/run/unit/control.sock ]; then\n\
 fi\n\
 \n\
 echo "Loading configuration..."\n\
-curl -X PUT --data-binary @/app/unit-config.json \\\n\
+RESPONSE=$(curl -X PUT --data-binary @/app/unit-config.json \\\n\
   --unix-socket /var/run/unit/control.sock \\\n\
-  http://localhost/config\n\
+  http://localhost/config 2>&1)\n\
+echo "$RESPONSE"\n\
+\n\
+if echo "$RESPONSE" | grep -q "error"; then\n\
+  echo "ERROR: Configuration failed to load!"\n\
+  echo "Response: $RESPONSE"\n\
+  exit 1\n\
+fi\n\
 \n\
 echo "Configuration loaded successfully"\n\
 echo "NGINX Unit is ready and listening on http://0.0.0.0:8080"\n\
