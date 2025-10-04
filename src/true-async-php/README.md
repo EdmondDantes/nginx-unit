@@ -271,13 +271,6 @@ curl --unix-socket /tmp/unit/control.unit.sock http://localhost/config
 3. When buffer freed → `shm_ack_handler()`
 4. `shm_ack_handler` writes remaining data and calls `end()` if needed
 
-## Limitations
-
-- Coroutines don't support standard PHP async functions (async/await)
-- TrueAsync SAPI is incompatible with traditional PHP-FPM code
-- All I/O operations must go through NGINX Unit API
-- `response->end()` is required — otherwise resource leak
-
 ## TODO
 
 - Implement `Request::getRequestContext()`

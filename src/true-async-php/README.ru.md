@@ -271,13 +271,6 @@ curl --unix-socket /tmp/unit/control.unit.sock http://localhost/config
 3. При освобождении буфера → `shm_ack_handler()`
 4. `shm_ack_handler` дописывает данные и вызывает `end()` при необходимости
 
-## Ограничения
-
-- Корутины не поддерживают стандартные PHP async функции (async/await)
-- TrueAsync SAPI несовместим с традиционным PHP-FPM кодом
-- Все операции I/O должны идти через NGINX Unit API
-- `response->end()` обязателен — иначе утечка ресурсов
-
 ## TODO
 
 - Реализовать `Request::getRequestContext()`
