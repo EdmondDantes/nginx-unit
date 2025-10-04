@@ -245,6 +245,18 @@ static nxt_conf_map_t  nxt_php_app_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_common_app_conf_t, u.php.options),
     },
+
+    {
+        nxt_string("async"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_common_app_conf_t, u.php.async),
+    },
+
+    {
+        nxt_string("entrypoint"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, u.php.entrypoint),
+    },
 };
 
 

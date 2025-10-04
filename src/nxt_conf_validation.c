@@ -1052,6 +1052,12 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_php_common_members[] = {
         .type       = NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_object,
         .u.members  = nxt_conf_vldt_php_options_members,
+    }, {
+        .name       = nxt_string("async"),
+        .type       = NXT_CONF_VLDT_BOOLEAN,
+    }, {
+        .name       = nxt_string("entrypoint"),
+        .type       = NXT_CONF_VLDT_STRING,
     },
 
     NXT_CONF_VLDT_NEXT(nxt_conf_vldt_common_members)
