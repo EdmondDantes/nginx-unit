@@ -9,6 +9,8 @@
 #include "php_main.h"
 #include "php_variables.h"
 #include "ext/standard/php_standard.h"
+#include "main/network_async.h"
+#include "Zend/zend_async_API.h"
 
 #include <nxt_main.h>
 #include <nxt_router.h>
@@ -16,6 +18,30 @@
 #include <nxt_unit_request.h>
 #include <nxt_http.h>
 
+#include "nxt_php_extension.h"
+
+/* External globals */
+extern zval  *nxt_php_request_callback;
+
+/* Port event data stored in poll event's extra data */
+typedef struct {
+    nxt_unit_ctx_t   *ctx;
+    nxt_unit_port_t  *port;
+} nxt_php_port_event_data_t;
+
+/* Pending write entry for drain_queue */
+struct nxt_php_pending_write_s {
+    nxt_queue_link_t         link;          /* For inclusion in drain_queue */
+    nxt_unit_request_info_t  *req;          /* Associated request */
+    zend_string              *data;         /* zend_string with increased refcount */
+    size_t                   offset;        /* How much already sent */
+};
+
+/* Async context data - stored in ctx->data for async mode */
+typedef struct {
+    nxt_queue_t              drain_queue;   /* Queue of pending writes */
+    nxt_unit_ctx_t           *ctx;          /* Back reference to Unit context */
+} nxt_php_async_ctx_data_t;
 
 #if (PHP_VERSION_ID >= 50400)
 #define NXT_HAVE_PHP_IGNORE_CWD 1
@@ -82,6 +108,12 @@ typedef void (*zif_handler)(INTERNAL_FUNCTION_PARAMETERS);
 static nxt_int_t nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     nxt_common_app_conf_t *conf);
 static nxt_int_t nxt_php_start(nxt_task_t *task, nxt_process_data_t *data);
+static nxt_int_t nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint);
+static bool nxt_php_activate_true_async(nxt_task_t *task);
+static void nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx);
+static int nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
+static void nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
+static void nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx);
 static nxt_int_t nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     nxt_conf_value_t *conf);
 static nxt_int_t nxt_php_set_ini_path(nxt_task_t *task, nxt_str_t *path,
@@ -107,6 +139,7 @@ static nxt_int_t nxt_php_do_301(nxt_unit_request_info_t *req);
 static nxt_int_t nxt_php_handle_fs_err(nxt_unit_request_info_t *req);
 
 static void nxt_php_request_handler(nxt_unit_request_info_t *req);
+static void nxt_php_request_handler_async(nxt_unit_request_info_t *req);
 static void nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx,
     nxt_unit_request_t *r);
 #if (PHP_VERSION_ID < 70400)
@@ -166,12 +199,11 @@ ZEND_FUNCTION(fastcgi_finish_request);
 PHP_MINIT_FUNCTION(nxt_php_ext);
 ZEND_NAMED_FUNCTION(nxt_php_chdir);
 
-
+/* PHP extension functions */
 static const zend_function_entry  nxt_php_ext_functions[] = {
     ZEND_FE(fastcgi_finish_request, arginfo_fastcgi_finish_request)
     ZEND_FE_END
 };
-
 
 zif_handler       nxt_php_chdir_handler;
 zend_auto_global  *nxt_php_server_ag;
@@ -193,7 +225,7 @@ static zend_module_entry  nxt_php_unit_module = {
 
 PHP_MINIT_FUNCTION(nxt_php_ext)
 {
-    zend_function  *func;
+    zend_function    *func;
 
     static const nxt_str_t  chdir = nxt_string("chdir");
 
@@ -204,6 +236,11 @@ PHP_MINIT_FUNCTION(nxt_php_ext)
 
     nxt_php_chdir_handler = func->internal_function.handler;
     func->internal_function.handler = nxt_php_chdir;
+
+    /* Register NginxUnit PHP extension classes */
+    if (nxt_php_extension_init() != NXT_OK) {
+        return FAILURE;
+    }
 
     return SUCCESS;
 }
@@ -367,7 +404,9 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
 static nxt_php_target_t  *nxt_php_targets;
 static nxt_int_t         nxt_php_last_target = -1;
 
-static nxt_unit_ctx_t    *nxt_php_unit_ctx;
+/* Global Unit context - needed by nxt_php_extension.c */
+nxt_unit_ctx_t              *nxt_php_unit_ctx;
+
 #if defined(ZTS) && (PHP_VERSION_ID < 70400)
 static void              ***tsrm_ls;
 #endif
@@ -385,6 +424,7 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     static const nxt_str_t  file_str = nxt_string("file");
     static const nxt_str_t  user_str = nxt_string("user");
     static const nxt_str_t  admin_str = nxt_string("admin");
+
 
     c = &conf->u.php;
 
@@ -456,6 +496,201 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
 }
 
 
+/**
+ * Add pending write to drain_queue
+ */
+nxt_php_pending_write_t *
+nxt_php_drain_queue_add(nxt_unit_ctx_t *ctx,
+                        nxt_unit_request_info_t *req,
+                        zend_string *str,
+                        size_t offset)
+{
+    nxt_php_async_ctx_data_t *async_data = ctx->data;
+    nxt_php_pending_write_t  *pw;
+
+    if (async_data == NULL) {
+        return NULL;
+    }
+
+    pw = malloc(sizeof(nxt_php_pending_write_t));
+    if (pw == NULL) {
+        return NULL;
+    }
+
+    pw->req = req;
+    pw->offset = offset;
+
+    /* Increase refcount - string won't be freed */
+    pw->data = zend_string_copy(str);
+
+    nxt_queue_insert_tail(&async_data->drain_queue, &pw->link);
+
+    return pw;
+}
+
+
+/**
+ * Remove and free pending write from drain_queue
+ */
+static void
+nxt_php_drain_queue_remove(nxt_php_pending_write_t *pw)
+{
+    nxt_queue_remove(&pw->link);
+
+    /* Decrease refcount - will be freed when refcount reaches 0 */
+    zend_string_release(pw->data);
+
+    free(pw);
+}
+
+
+/**
+ * Callback function called when port fd becomes readable
+ */
+static void
+nxt_php_port_event_callback(zend_async_event_t *event, zend_async_event_callback_t *callback, void *result, zend_object *exception)
+{
+    nxt_php_port_event_data_t  *event_data;
+
+    /* Get pointer to our extra data using extra_offset */
+    event_data = (nxt_php_port_event_data_t *)((char *)event + event->extra_offset);
+
+    /* Process messages from this port */
+    nxt_unit_process_port_msg(event_data->ctx, event_data->port);
+}
+
+
+/**
+ * Callback to add port - called by Unit for each port
+ */
+static int
+nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
+{
+    zend_async_poll_event_t      *poll_event;
+    nxt_php_port_event_data_t    *event_data;
+
+    nxt_php_unit_ctx = ctx;
+
+    /* Skip ports without input fd */
+    if (port->in_fd == -1) {
+        return NXT_UNIT_OK;
+    }
+
+    /* Set port to non-blocking mode */
+    if (fcntl(port->in_fd, F_SETFL, O_NONBLOCK) == -1) {
+        nxt_unit_warn(ctx, "fcntl(%d, O_NONBLOCK) failed: %s (%d)",
+                      port->in_fd, strerror(errno), errno);
+        return NXT_UNIT_ERROR;
+    }
+
+    /* Create TrueAsync poll event with extra space for our data */
+    poll_event = ZEND_ASYNC_NEW_POLL_EVENT_EX(
+        port->in_fd, false, ASYNC_READABLE, sizeof(nxt_php_port_event_data_t)
+    );
+
+    if (poll_event == NULL) {
+        nxt_unit_alert(ctx, "Failed to create TrueAsync poll event for port fd=%d", port->in_fd);
+        return NXT_UNIT_ERROR;
+    }
+
+    /* Get pointer to our extra data */
+    event_data = (nxt_php_port_event_data_t *)((char *)poll_event + poll_event->base.extra_offset);
+    event_data->ctx = ctx;
+    event_data->port = port;
+
+    /* Register callback with poll event */
+    if (!poll_event->base.add_callback(&poll_event->base, ZEND_ASYNC_EVENT_CALLBACK(nxt_php_port_event_callback))) {
+        nxt_unit_alert(ctx, "Failed to add callback for port fd=%d", port->in_fd);
+        poll_event->base.dispose(&poll_event->base);
+        return NXT_UNIT_ERROR;
+    }
+
+    /* Start polling */
+    if (!poll_event->base.start(&poll_event->base)) {
+        nxt_unit_alert(ctx, "Failed to start polling for port fd=%d", port->in_fd);
+        poll_event->base.dispose(&poll_event->base);
+        return NXT_UNIT_ERROR;
+    }
+
+    /* Save poll_event in port->data for cleanup */
+    port->data = poll_event;
+
+    return NXT_UNIT_OK;
+}
+
+
+/**
+ * Callback to remove port
+ */
+static void
+nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
+{
+    zend_async_poll_event_t  *poll_event;
+
+    if (port->data != NULL) {
+        poll_event = (zend_async_poll_event_t *) port->data;
+
+        /* Dispose using TrueAsync cleanup */
+        poll_event->base.dispose(&poll_event->base);
+
+        port->data = NULL;
+    }
+}
+
+
+/**
+ * SHM ACK handler - called when Router releases shared memory
+ */
+static void
+nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx)
+{
+    nxt_php_async_ctx_data_t *async_data = ctx->data;
+    nxt_queue_link_t         *lnk;
+    nxt_php_pending_write_t  *pw;
+    ssize_t                  res;
+    size_t                   remaining;
+
+    if (async_data == NULL) {
+        return;
+    }
+
+    /* Process all pending writes in drain_queue */
+    lnk = nxt_queue_first(&async_data->drain_queue);
+
+    while (lnk != nxt_queue_tail(&async_data->drain_queue)) {
+        pw = nxt_container_of(lnk, nxt_php_pending_write_t, link);
+        lnk = nxt_queue_next(lnk);  /* Save next element before potential removal */
+
+        remaining = ZSTR_LEN(pw->data) - pw->offset;
+
+        /* Try to send remaining data */
+        res = nxt_unit_response_write_nb(pw->req,
+                                         ZSTR_VAL(pw->data) + pw->offset,
+                                         remaining,
+                                         0);
+
+        if (res < 0) {
+            /* Error - remove from queue */
+            nxt_unit_warn(ctx, "drain_queue: write error, removing pending write");
+            nxt_php_drain_queue_remove(pw);
+            continue;
+        }
+
+        if (res == 0) {
+            /* Still no space - stop processing */
+            return;
+        }
+
+        pw->offset += res;
+
+        if (pw->offset >= ZSTR_LEN(pw->data)) {
+            /* ALL SENT! Remove from queue */
+            nxt_php_drain_queue_remove(pw);
+        }
+    }
+}
+
+
 static nxt_int_t
 nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 {
@@ -468,6 +703,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     nxt_conf_value_t       *value;
     nxt_php_app_conf_t     *c;
     nxt_common_app_conf_t  *conf;
+
 
     conf = data->app;
     c = &conf->u.php;
@@ -507,7 +743,31 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
         return ret;
     }
 
-    php_init.callbacks.request_handler = nxt_php_request_handler;
+    /* Choose request handler based on mode */
+    if (c->async && c->entrypoint.length > 0) {
+        nxt_debug(task, "PHP HTTP Server mode enabled with entrypoint: %V", &c->entrypoint);
+        php_init.callbacks.add_port = nxt_php_add_port;
+        php_init.callbacks.remove_port = nxt_php_remove_port;
+        php_init.callbacks.request_handler = nxt_php_request_handler_async;
+        php_init.callbacks.shm_ack_handler = nxt_php_shm_ack_handler;
+
+        if (nxt_slow_path(nxt_php_async_load_entrypoint(task, &c->entrypoint) != NXT_OK)) {
+            nxt_alert(task, "failed to load entrypoint script");
+            return NXT_ERROR;
+        }
+
+        if (nxt_php_request_callback == NULL) {
+            nxt_alert(task, "TrueAsync: Request callback not registered in the entrypoint script!");
+            return NXT_ERROR;
+        }
+
+        if(nxt_slow_path(!nxt_php_activate_true_async(task))) {
+            return NXT_ERROR;
+        }
+    } else {
+        nxt_debug(task, "PHP standard mode");
+        php_init.callbacks.request_handler = nxt_php_request_handler;
+    }
 
     unit_ctx = nxt_unit_init(&php_init);
     if (nxt_slow_path(unit_ctx == NULL)) {
@@ -516,7 +776,29 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
     nxt_php_unit_ctx = unit_ctx;
 
-    nxt_unit_run(nxt_php_unit_ctx);
+    /* Initialize async context data for drain_queue */
+    if (c->async && c->entrypoint.length > 0) {
+        nxt_php_async_ctx_data_t *async_data;
+
+        async_data = malloc(sizeof(nxt_php_async_ctx_data_t));
+        if (async_data == NULL) {
+            nxt_alert(task, "Failed to allocate async context data");
+            nxt_unit_done(unit_ctx);
+            return NXT_ERROR;
+        }
+
+        nxt_queue_init(&async_data->drain_queue);
+        async_data->ctx = unit_ctx;
+
+        unit_ctx->data = async_data;
+    }
+
+    if (c->async && c->entrypoint.length > 0) {
+        /* Suspend main coroutine until the server continues to operate successfully */
+        nxt_php_suspend_coroutine(nxt_php_unit_ctx);
+    } else {
+        nxt_unit_run(nxt_php_unit_ctx);
+    }
     nxt_unit_done(nxt_php_unit_ctx);
 
     exit(0);
@@ -1306,6 +1588,14 @@ nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC)
 
     ctx = SG(server_context);
 
+    /* During entrypoint execution there's no request context */
+    if (ctx == NULL || ctx->req == NULL) {
+        /* Log output from entrypoint to unit log */
+        nxt_unit_log(nxt_php_unit_ctx, NXT_UNIT_LOG_INFO,
+                     "PHP output: %.*s", (int)str_length, str);
+        return str_length;
+    }
+
     rc = nxt_unit_response_write(ctx->req, str, str_length);
     if (nxt_fast_path(rc == NXT_UNIT_OK)) {
         return str_length;
@@ -1329,6 +1619,12 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
     nxt_unit_request_info_t  *req;
 
     ctx = SG(server_context);
+
+    /* During entrypoint execution there's no request context */
+    if (ctx == NULL || ctx->req == NULL) {
+        return SAPI_HEADER_SENT_SUCCESSFULLY;
+    }
+
     req = ctx->req;
 
     nxt_unit_req_debug(req, "nxt_php_send_headers");
@@ -1403,6 +1699,11 @@ nxt_php_read_post(char *buffer, uint count_bytes TSRMLS_DC)
 
     ctx = SG(server_context);
 
+    /* During entrypoint execution there's no request context */
+    if (ctx == NULL || ctx->req == NULL) {
+        return 0;
+    }
+
     nxt_unit_req_debug(ctx->req, "nxt_php_read_post %d", (int) count_bytes);
 
     return nxt_unit_request_read(ctx->req, buffer, count_bytes);
@@ -1415,6 +1716,11 @@ nxt_php_read_cookies(TSRMLS_D)
     nxt_php_run_ctx_t  *ctx;
 
     ctx = SG(server_context);
+
+    /* During entrypoint execution there's no request context */
+    if (ctx == NULL) {
+        return NULL;
+    }
 
     nxt_unit_req_debug(ctx->req, "nxt_php_read_cookies");
 
@@ -1432,6 +1738,11 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
     nxt_unit_request_info_t  *req;
 
     ctx = SG(server_context);
+
+    /* During entrypoint execution there's no request context */
+    if (ctx == NULL || ctx->req == NULL) {
+        return;
+    }
 
     req = ctx->req;
     r = req->request;
@@ -1640,7 +1951,7 @@ nxt_php_log_message(char *message TSRMLS_DC)
 
     ctx = SG(server_context);
 
-    if (ctx != NULL) {
+    if (ctx != NULL && ctx->req != NULL) {
         nxt_unit_req_log(ctx->req, NXT_UNIT_LOG_NOTICE,
                          "php message: %s", message);
 
@@ -1648,4 +1959,244 @@ nxt_php_log_message(char *message TSRMLS_DC)
         nxt_unit_log(nxt_php_unit_ctx, NXT_UNIT_LOG_NOTICE,
                      "php message: %s", message);
     }
+}
+
+
+/* TrueAsync Mode Implementation */
+
+/* External globals */
+extern zval  *nxt_php_request_callback;
+
+/**
+ * The request handler invoked from NGINX UNIT.
+ * The handler uses a PHP callback function (nxt_php_request_callback) to process the request.
+ *
+ **/
+static void
+nxt_php_request_handler_async(nxt_unit_request_info_t *req)
+{
+    zend_coroutine_t *coroutine;
+
+    /* We will handle each request in a separate coroutine. */
+    coroutine = ZEND_ASYNC_SPAWN();
+    coroutine->internal_entry = nxt_php_request_coroutine_entry;
+    coroutine->extended_data = req;
+}
+
+/* Load and execute entrypoint script in async mode */
+static nxt_int_t
+nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint)
+{
+    FILE              *fp;
+    const char        *filename;
+    zend_file_handle  file_handle;
+
+    nxt_log(task, NXT_LOG_INFO, "TrueAsync: nxt_php_async_load_entrypoint called, PID=%d", getpid());
+
+
+    /* Create null-terminated filename */
+    char *filename_buf = nxt_malloc(entrypoint->length + 1);
+    if (filename_buf == NULL) {
+        nxt_alert(task, "TrueAsync: Failed to allocate filename buffer");
+        return NXT_ERROR;
+    }
+
+    nxt_memcpy(filename_buf, entrypoint->start, entrypoint->length);
+    filename_buf[entrypoint->length] = '\0';
+    filename = filename_buf;
+
+
+    fp = fopen(filename, "re");
+    if (fp == NULL) {
+        nxt_alert(task, "TrueAsync: Failed to open entrypoint %s", filename);
+        nxt_free(filename_buf);
+        return NXT_ERROR;
+    }
+
+    /* Initialize minimal SG() fields like CLI does */
+    SG(request_info).argc = 0;
+    SG(request_info).argv = NULL;
+    SG(request_info).path_translated = (char*)filename;
+    SG(server_context) = NULL;
+
+    /* Call php_request_startup() like CLI does */
+#ifdef NXT_PHP7
+    if (nxt_slow_path(php_request_startup() == FAILURE)) {
+#else
+    if (nxt_slow_path(php_request_startup(TSRMLS_C) == FAILURE)) {
+#endif
+        nxt_alert(task, "TrueAsync: php_request_startup() failed");
+        fclose(fp);
+        nxt_free(filename_buf);
+        return NXT_ERROR;
+    }
+
+    nxt_zend_stream_init_fp(&file_handle, fp, filename);
+
+    /* Execute entrypoint script */
+    int result = php_execute_script(&file_handle TSRMLS_CC);
+
+    if (result == FAILURE) {
+        nxt_alert(task, "TrueAsync: php_execute_script() FAILED!");
+        fclose(fp);
+        nxt_free(filename_buf);
+        return NXT_ERROR;
+    }
+
+#if (PHP_VERSION_ID >= 80100)
+    zend_destroy_file_handle(&file_handle);
+#endif
+
+    nxt_free(filename_buf);
+
+    /* Check if callback was registered */
+    if (nxt_php_request_callback == NULL) {
+        nxt_alert(task, "TrueAsync: No request handler registered! Call HttpServer->onRequest() in your entrypoint.");
+        return NXT_ERROR;
+    }
+
+    /* Check callback is callable */
+    if (nxt_php_request_callback != NULL && Z_TYPE_P(nxt_php_request_callback) == IS_OBJECT) {
+        nxt_log(task, NXT_LOG_INFO, "TrueAsync: Callback is object, type OK");
+    } else {
+        nxt_alert(task, "TrueAsync: Callback has wrong type: %d",
+                  nxt_php_request_callback ? Z_TYPE_P(nxt_php_request_callback) : -1);
+    }
+
+    /* DON'T call php_request_shutdown() - we want the callback to persist after fork */
+
+    return NXT_OK;
+}
+
+
+/* Server wait event methods */
+static bool
+nxt_php_server_wait_event_start(zend_async_event_t *event)
+{
+    /* No action needed - event waits indefinitely */
+    return true;
+}
+
+static bool
+nxt_php_server_wait_event_stop(zend_async_event_t *event)
+{
+    /* No action needed */
+    return true;
+}
+
+static bool
+nxt_php_server_wait_event_add_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
+{
+    return zend_async_callbacks_push(event, callback);
+}
+
+static bool
+nxt_php_server_wait_event_del_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
+{
+    return zend_async_callbacks_remove(event, callback);
+}
+
+static bool
+nxt_php_server_wait_event_replay(zend_async_event_t *event, zend_async_event_callback_t *callback, zval *result, zend_object **exception)
+{
+    /* Event never resolves - cannot replay */
+    return false;
+}
+
+static zend_string *
+nxt_php_server_wait_event_info(zend_async_event_t *event)
+{
+    return zend_string_init("NGINX Unit server waiting", sizeof("NGINX Unit server waiting") - 1, 0);
+}
+
+static bool
+nxt_php_server_wait_event_dispose(zend_async_event_t *event)
+{
+    if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+        ZEND_ASYNC_EVENT_DEL_REF(event);
+        return true;
+    }
+
+    if (ZEND_ASYNC_EVENT_REFCOUNT(event) == 1) {
+        ZEND_ASYNC_EVENT_DEL_REF(event);
+    }
+
+    /* Notify all callbacks that event is disposed */
+    ZEND_ASYNC_CALLBACKS_NOTIFY(event, NULL, NULL);
+
+    /* Free the event */
+    efree(event);
+
+    return true;
+}
+
+static bool
+nxt_php_activate_true_async(nxt_task_t *task)
+{
+    if (ZEND_ASYNC_IS_OFF) {
+        nxt_alert(task, "TrueAsync: async mode is off");
+        return false;
+    }
+
+    if (ZEND_ASYNC_IS_READY) {
+        if (!ZEND_ASYNC_SCHEDULER_LAUNCH()) {
+            nxt_alert(task, "TrueAsync: Failed to launch scheduler");
+            return false;
+        }
+    }
+
+    return ZEND_ASYNC_IS_ACTIVE;
+}
+
+/**
+ * Suspend coroutine until application should finish
+ * Event handlers registered via add_port/remove_port will be triggered by scheduler
+ */
+static void
+nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx)
+{
+    zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+    if (coroutine == NULL) {
+        nxt_unit_alert(ctx, "TrueAsync: Failed to get current coroutine");
+        return;
+    }
+
+    /* Create server wait event (it's custom nginx unit trigger for TrueAsync) */
+    zend_async_event_t *event = emalloc(sizeof(zend_async_event_t));
+    if (event == NULL) {
+        nxt_unit_alert(ctx, "TrueAsync: Failed to allocate server wait event");
+        return;
+    }
+
+    /* Initialize event structure */
+    memset(event, 0, sizeof(zend_async_event_t));
+
+    /* Set event methods */
+    event->start = nxt_php_server_wait_event_start;
+    event->stop = nxt_php_server_wait_event_stop;
+    event->add_callback = nxt_php_server_wait_event_add_callback;
+    event->del_callback = nxt_php_server_wait_event_del_callback;
+    event->replay = nxt_php_server_wait_event_replay;
+    event->info = nxt_php_server_wait_event_info;
+    event->dispose = nxt_php_server_wait_event_dispose;
+
+    /* Create waker for coroutine */
+    if (UNEXPECTED(zend_async_waker_new(coroutine) == NULL)) {
+        nxt_unit_alert(ctx, "TrueAsync: Failed to create waker");
+        event->dispose(event);
+        return;
+    }
+
+    /* Attach coroutine to wait event - it will suspend until GRACEFUL_SHUTDOWN */
+    zend_async_resume_when(coroutine, event, true, zend_async_waker_callback_resolve, NULL);
+
+    if (UNEXPECTED(EG(exception) != NULL)) {
+        nxt_unit_alert(ctx, "TrueAsync: Failed to attach coroutine to wait event");
+        zend_async_waker_clean(coroutine);
+        event->dispose(event);
+        return;
+    }
+
+    ZEND_ASYNC_SUSPEND();
+    zend_async_waker_clean(coroutine);
 }

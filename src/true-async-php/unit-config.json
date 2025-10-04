@@ -1,0 +1,17 @@
+{
+  "applications": {
+    "my-php-async-app": {
+      "type": "php",
+      "async": true,
+      "processes": 2,
+      "entrypoint": "/home/edmond/nginx-unit/src/true-async-php/entrypoint.php",
+      "working_directory": "/home/edmond/nginx-unit/src/true-async-php",
+      "root": "/home/edmond/nginx-unit/src/true-async-php"
+    }
+  },
+  "listeners": {
+    "127.0.0.1:8080": {
+      "pass": "applications/my-php-async-app"
+    }
+  }
+}
