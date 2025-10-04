@@ -109,7 +109,7 @@ RUN ./configure php \
 
 # ---------- 10. Copy module to correct location and verify ----------
 RUN mkdir -p /usr/local/unit/modules \
-    && cp /usr/local/lib/unit/modules/php.unit.so /usr/local/unit/modules/ \
+    && cp build/lib/unit/modules/php.unit.so /usr/local/unit/modules/ \
     && ls -la /usr/local/unit/modules/
 
 # ---------- RUNTIME STAGE ----------
