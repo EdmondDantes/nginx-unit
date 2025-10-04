@@ -88,29 +88,13 @@ RUN mkdir -p /etc/php.d && echo "opcache.enable_cli=1" > /etc/php.d/opcache.ini
 WORKDIR /usr/src/nginx-unit
 
 # Configure and build Unit core
-RUN ./configure \
-        --prefix=/usr/local/unit \
-        --state=/var/lib/unit \
-        --control=unix:/var/run/unit/control.sock \
-        --pid=/var/run/unit/unit.pid \
-        --log=/var/log/unit/unit.log \
-        --modules=/usr/local/unit/modules \
-        --user=unit \
-        --group=unit \
-    && make -j$(nproc) \
-    && make install
+RUN ./configure && make -j$(nproc) && make install
 
 # ---------- 9. Build PHP module for NGINX Unit ----------
-RUN ./configure php \
-        --module=php \
-        --config=/usr/local/bin/php-config \
-    && make php \
-    && make php-install
+RUN ./configure php && make php && make php-install
 
-# ---------- 10. Copy module to correct location and verify ----------
-RUN mkdir -p /usr/local/unit/modules \
-    && cp build/lib/unit/modules/php.unit.so /usr/local/unit/modules/ \
-    && ls -la /usr/local/unit/modules/
+# ---------- 10. Verify module was installed ----------
+RUN ls -la /usr/local/lib/unit/modules/
 
 # ---------- RUNTIME STAGE ----------
 FROM ubuntu:24.04 AS runtime
@@ -137,21 +121,21 @@ COPY --from=builder /usr/local /usr/local
 COPY --from=builder /etc/php.d /etc/php.d
 
 # Create runtime directories with proper permissions
-RUN mkdir -p /var/run/unit /var/lib/unit /var/log/unit /app \
-    && chown -R unit:unit /var/run/unit /var/lib/unit /var/log/unit /app
+RUN mkdir -p /usr/local/var/run/unit /usr/local/var/lib/unit /usr/local/var/log/unit /app \
+    && chown -R unit:unit /usr/local/var/run/unit /usr/local/var/lib/unit /usr/local/var/log/unit /app
 
 # Update library cache
 RUN ldconfig
 
 # Set PATH
-ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/local/unit/sbin:$PATH"
+ENV PATH="/usr/local/bin:/usr/local/sbin:$PATH"
 
 # Verify installations
-RUN php -v && /usr/local/unit/sbin/unitd --version
+RUN php -v && unitd --version
 
 # Verify PHP module exists
-RUN ls -la /usr/local/unit/modules/ && \
-    test -f /usr/local/unit/modules/php.unit.so || \
+RUN ls -la /usr/local/lib/unit/modules/ && \
+    test -f /usr/local/lib/unit/modules/php.unit.so || \
     (echo "ERROR: PHP module not found!" && exit 1)
 
 # Copy example application
@@ -177,33 +161,27 @@ RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
 echo "Starting NGINX Unit..."\n\
-/usr/local/unit/sbin/unitd \\\n\
-  --no-daemon \\\n\
-  --log /var/log/unit/unit.log \\\n\
-  --state /var/lib/unit \\\n\
-  --control unix:/var/run/unit/control.sock \\\n\
-  --pid /var/run/unit/unit.pid \\\n\
-  --modules /usr/local/unit/modules &\n\
+unitd --no-daemon &\n\
 \n\
 UNITD_PID=$!\n\
 \n\
 echo "Waiting for control socket..."\n\
 for i in {1..10}; do\n\
-  if [ -S /var/run/unit/control.sock ]; then\n\
+  if [ -S /usr/local/var/run/unit/control.unit.sock ]; then\n\
     echo "Control socket ready"\n\
     break\n\
   fi\n\
   sleep 1\n\
 done\n\
 \n\
-if [ ! -S /var/run/unit/control.sock ]; then\n\
+if [ ! -S /usr/local/var/run/unit/control.unit.sock ]; then\n\
   echo "Control socket not available after 10 seconds"\n\
   exit 1\n\
 fi\n\
 \n\
 echo "Loading configuration..."\n\
 RESPONSE=$(curl -X PUT --data-binary @/app/unit-config.json \\\n\
-  --unix-socket /var/run/unit/control.sock \\\n\
+  --unix-socket /usr/local/var/run/unit/control.unit.sock \\\n\
   http://localhost/config 2>&1)\n\
 echo "$RESPONSE"\n\
 \n\
