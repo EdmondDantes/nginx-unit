@@ -1980,10 +1980,7 @@ nxt_php_request_handler_async(nxt_unit_request_info_t *req)
     zend_coroutine_t    *coroutine;
 
     /* 1. Create new Scope for this request with its own superglobals */
-    request_scope = ZEND_ASYNC_NEW_SCOPE(
-        ZEND_ASYNC_CURRENT_SCOPE,  /* parent_scope */
-        true                         /* with_zend_object */
-    );
+    request_scope = ZEND_ASYNC_NEW_SCOPE(ZEND_ASYNC_CURRENT_SCOPE);
 
     if (request_scope == NULL) {
         nxt_unit_req_alert(req, "Failed to create request scope");
