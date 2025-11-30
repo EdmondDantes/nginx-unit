@@ -48,7 +48,7 @@ nxt_utf8_file_name_test(nxt_thread_t *thr)
     nxt_file_t           uc_file, lc_file;
     const u_char         *pp;
     nxt_file_name_t      uc_name[10], lc_name[10];
-    static const u_char  utf8[4] = "UTF8";
+    static const u_char  utf8[4] NXT_NONSTRING = "UTF8";
 
     nxt_thread_time_update(thr);
 

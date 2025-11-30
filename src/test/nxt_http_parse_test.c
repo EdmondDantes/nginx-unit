@@ -12,7 +12,7 @@ typedef struct {
     nxt_str_t  method;
     nxt_str_t  target;
     nxt_str_t  args;
-    u_char     version[8];
+    u_char     version[8] NXT_NONSTRING;
 
     /* target with "/." */
     unsigned   complex_target:1;

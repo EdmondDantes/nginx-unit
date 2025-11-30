@@ -52,9 +52,9 @@ jobs:
       - name: configure unit CC=${{ matrix.compiler }}
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            ./configure --openssl --otel --zlib --zstd --brotli --cc=clang
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
           else
-            ./configure --openssl --otel --zlib --zstd --brotli
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
           fi
 
       - name: make unit
@@ -142,9 +142,9 @@ jobs:
       - name: configure unit CC=${{ matrix.compiler }}
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            ./configure --openssl --otel --zlib --zstd --brotli --cc=clang
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
           else
-            ./configure --openssl --otel --zlib --zstd --brotli
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
           fi
 
       - name: make unit
