@@ -19,6 +19,7 @@
 #include <nxt_http.h>
 
 #include "nxt_php_extension.h"
+#include "nxt_php_superglobals.h"
 
 /* External globals */
 extern zval  *nxt_php_request_callback;
@@ -1975,12 +1976,47 @@ extern zval  *nxt_php_request_callback;
 static void
 nxt_php_request_handler_async(nxt_unit_request_info_t *req)
 {
-    zend_coroutine_t *coroutine;
+    zend_async_scope_t  *request_scope;
+    zend_coroutine_t    *coroutine;
 
-    /* We will handle each request in a separate coroutine. */
-    coroutine = ZEND_ASYNC_SPAWN();
+    /* 1. Create new Scope for this request with its own superglobals */
+    request_scope = ZEND_ASYNC_NEW_SCOPE(
+        ZEND_ASYNC_CURRENT_SCOPE,  /* parent_scope */
+        true                         /* with_zend_object */
+    );
+
+    if (request_scope == NULL) {
+        nxt_unit_req_alert(req, "Failed to create request scope");
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
+    /* 2. DISABLE inheriting global superglobals - each request has its own */
+    ZEND_ASYNC_SCOPE_CLR_INHERIT_SUPERGLOBALS(request_scope);
+
+    /* 3. Populate superglobals with data from HTTP request */
+    /* Note: nxt_php_register_variables() will be called inside and will read from SG(server_context) */
+    nxt_php_scope_populate_superglobals(request_scope);
+
+    /* 4. Create coroutine within this Scope */
+    coroutine = ZEND_ASYNC_NEW_COROUTINE(request_scope);
+    if (coroutine == NULL) {
+        nxt_unit_req_alert(req, "Failed to create coroutine");
+        /* Scope will be automatically cleaned up */
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
+    /* 5. Setup coroutine entry point and data */
     coroutine->internal_entry = nxt_php_request_coroutine_entry;
     coroutine->extended_data = req;
+
+    /* 6. Enqueue coroutine for execution */
+    if (!ZEND_ASYNC_ENQUEUE_COROUTINE(coroutine)) {
+        nxt_unit_req_alert(req, "Failed to enqueue coroutine");
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
 }
 
 /* Load and execute entrypoint script in async mode */
