@@ -1729,7 +1729,7 @@ nxt_php_read_cookies(TSRMLS_D)
 }
 
 
-static void
+void
 nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 {
     const char               *name;
