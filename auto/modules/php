@@ -228,7 +228,6 @@ $echo >> $NXT_MAKEFILE
 NXT_PHP_MODULE_SRCS=" \
     src/nxt_php_sapi.c \
     src/nxt_php_extension.c \
-    src/nxt_php_superglobals.c \
 "
 
 # The php module object files.

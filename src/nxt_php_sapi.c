@@ -19,7 +19,6 @@
 #include <nxt_http.h>
 
 #include "nxt_php_extension.h"
-#include "nxt_php_superglobals.h"
 
 /* External globals */
 extern zval  *nxt_php_request_callback;
@@ -143,6 +142,8 @@ static void nxt_php_request_handler(nxt_unit_request_info_t *req);
 static void nxt_php_request_handler_async(nxt_unit_request_info_t *req);
 static void nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx,
     nxt_unit_request_t *r);
+static void nxt_php_scope_init_superglobals(zend_async_scope_t *scope);
+static void nxt_php_scope_populate_superglobals(zend_async_scope_t *scope);
 #if (PHP_VERSION_ID < 70400)
 static void nxt_zend_stream_init_fp(zend_file_handle *handle, FILE *fp,
     const char *filename);
@@ -1976,8 +1977,14 @@ extern zval  *nxt_php_request_callback;
 static void
 nxt_php_request_handler_async(nxt_unit_request_info_t *req)
 {
-    zend_async_scope_t  *request_scope;
-    zend_coroutine_t    *coroutine;
+    zend_async_scope_t    *request_scope;
+    zend_coroutine_t      *coroutine;
+    nxt_php_run_ctx_t     run_ctx;
+    nxt_unit_request_t    *r;
+    nxt_unit_field_t      *f;
+    void                  *saved_server_context;
+
+    r = req->request;
 
     /* 1. Create new Scope for this request with its own superglobals */
     request_scope = ZEND_ASYNC_NEW_SCOPE(ZEND_ASYNC_CURRENT_SCOPE);
@@ -1991,11 +1998,41 @@ nxt_php_request_handler_async(nxt_unit_request_info_t *req)
     /* 2. DISABLE inheriting global superglobals - each request has its own */
     ZEND_ASYNC_SCOPE_CLR_INHERIT_SUPERGLOBALS(request_scope);
 
-    /* 3. Populate superglobals with data from HTTP request */
-    /* Note: nxt_php_register_variables() will be called inside and will read from SG(server_context) */
+    /* 3. Setup SG(server_context) and SG(request_info) for superglobals population */
+    saved_server_context = SG(server_context);
+
+    /* Prepare run context */
+    nxt_memzero(&run_ctx, sizeof(run_ctx));
+    run_ctx.req = req;
+
+    /* Extract cookie if present */
+    if (r->cookie_field != NXT_UNIT_NONE_FIELD) {
+        f = r->fields + r->cookie_field;
+        run_ctx.cookie = nxt_unit_sptr_get(&f->value);
+    }
+
+    /* Setup SG(server_context) */
+    SG(server_context) = &run_ctx;
+
+    /* Setup SG(request_info) for php_default_treat_data */
+    SG(request_info).request_method = nxt_unit_sptr_get(&r->method);
+    SG(request_info).query_string = r->query.offset ? nxt_unit_sptr_get(&r->query) : NULL;
+    SG(request_info).content_length = r->content_length;
+
+    if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
+        f = r->fields + r->content_type_field;
+        SG(request_info).content_type = nxt_unit_sptr_get(&f->value);
+    } else {
+        SG(request_info).content_type = NULL;
+    }
+
+    /* 4. Populate superglobals with data from HTTP request */
     nxt_php_scope_populate_superglobals(request_scope);
 
-    /* 4. Create coroutine within this Scope */
+    /* 5. Restore original SG(server_context) */
+    SG(server_context) = saved_server_context;
+
+    /* 6. Create coroutine within this Scope */
     coroutine = ZEND_ASYNC_NEW_COROUTINE(request_scope);
     if (coroutine == NULL) {
         nxt_unit_req_alert(req, "Failed to create coroutine");
@@ -2232,4 +2269,84 @@ nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx)
 
     ZEND_ASYNC_SUSPEND();
     zend_async_waker_clean(coroutine);
+}
+
+
+static void
+nxt_php_scope_init_superglobals(zend_async_scope_t *scope)
+{
+    zval empty_array;
+
+    if (scope->superglobals != NULL) {
+        return;
+    }
+
+    ALLOC_HASHTABLE(scope->superglobals);
+    zend_hash_init(scope->superglobals, 8, NULL, ZVAL_PTR_DTOR, 0);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_GET", sizeof("_GET") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_POST", sizeof("_POST") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_ENV", sizeof("_ENV") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_FILES", sizeof("_FILES") - 1, &empty_array);
+
+    array_init(&empty_array);
+    zend_hash_str_add(scope->superglobals, "_REQUEST", sizeof("_REQUEST") - 1, &empty_array);
+}
+
+
+static void
+nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
+{
+    zval               *server_array, *get_array, *post_array, *cookie_array;
+    nxt_php_run_ctx_t  *ctx;
+    nxt_unit_request_t *r;
+
+    if (scope->superglobals == NULL) {
+        nxt_php_scope_init_superglobals(scope);
+    }
+
+    ctx = SG(server_context);
+    if (ctx == NULL || ctx->req == NULL) {
+        return;
+    }
+
+    r = ctx->req->request;
+
+    server_array = zend_hash_str_find(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1);
+    get_array    = zend_hash_str_find(scope->superglobals, "_GET", sizeof("_GET") - 1);
+    post_array   = zend_hash_str_find(scope->superglobals, "_POST", sizeof("_POST") - 1);
+    cookie_array = zend_hash_str_find(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1);
+
+    if (server_array != NULL) {
+        nxt_php_register_variables(server_array);
+    }
+
+    if (get_array != NULL && r->query_length > 0) {
+        char *query = estrndup((char *)nxt_unit_sptr_get(&r->query), r->query_length);
+        php_default_treat_data(PARSE_GET, query, get_array);
+    }
+
+    if (cookie_array != NULL && ctx->cookie != NULL) {
+        char *cookie = estrdup(ctx->cookie);
+        php_default_treat_data(PARSE_COOKIE, cookie, cookie_array);
+    }
+
+    if (post_array != NULL &&
+        SG(request_info).request_method &&
+        !strcasecmp(SG(request_info).request_method, "POST")) {
+        php_default_treat_data(PARSE_POST, NULL, post_array);
+    }
 }
