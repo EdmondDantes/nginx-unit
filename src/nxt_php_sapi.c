@@ -163,6 +163,8 @@ nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
 static void nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
     const char *str, uint32_t len, zval *track_vars_array TSRMLS_DC);
 void nxt_php_register_variables(zval *track_vars_array TSRMLS_DC);
+static void nxt_php_register_variables_async(nxt_unit_request_info_t *req,
+    nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC);
 #if NXT_PHP8
 static void nxt_php_log_message(const char *message, int syslog_type_int);
 #else
@@ -1854,6 +1856,126 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 
 
 static void
+nxt_php_register_variables_async(nxt_unit_request_info_t *req,
+    nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC)
+{
+    const char               *name;
+    char                     *str;
+    nxt_unit_field_t         *f, *f_end;
+    nxt_unit_request_t       *r;
+
+    r = req->request;
+
+    nxt_unit_req_debug(req, "nxt_php_register_variables_async");
+
+    /* Register SERVER_SOFTWARE */
+    php_register_variable_safe((char *) "SERVER_SOFTWARE",
+                               (char *) nxt_server.start,
+                               nxt_server.length, track_vars_array TSRMLS_CC);
+
+    /* Register SERVER_PROTOCOL */
+    str = nxt_unit_sptr_get(&r->version);
+    php_register_variable_safe((char *) "SERVER_PROTOCOL", str,
+                               r->version_length, track_vars_array TSRMLS_CC);
+
+    /* Register PHP_SELF and PATH_INFO */
+    if (ctx->path_info.length != 0) {
+        str = nxt_unit_sptr_get(&r->path);
+        php_register_variable_safe((char *) "PHP_SELF", str,
+                                   r->path_length, track_vars_array TSRMLS_CC);
+        php_register_variable_safe((char *) "PATH_INFO",
+                                   (char *) ctx->path_info.start,
+                                   ctx->path_info.length, track_vars_array TSRMLS_CC);
+    } else {
+        php_register_variable_safe((char *) "PHP_SELF",
+                                   (char *) ctx->script_name.start,
+                                   ctx->script_name.length, track_vars_array TSRMLS_CC);
+    }
+
+    /* Register SCRIPT_NAME */
+    php_register_variable_safe((char *) "SCRIPT_NAME",
+                               (char *) ctx->script_name.start,
+                               ctx->script_name.length, track_vars_array TSRMLS_CC);
+
+    /* Register SCRIPT_FILENAME */
+    php_register_variable_safe((char *) "SCRIPT_FILENAME",
+                               (char *) ctx->script_filename.start,
+                               ctx->script_filename.length, track_vars_array TSRMLS_CC);
+
+    /* Register DOCUMENT_ROOT */
+    php_register_variable_safe((char *) "DOCUMENT_ROOT",
+                               (char *) ctx->root->start,
+                               ctx->root->length, track_vars_array TSRMLS_CC);
+
+    /* Register REQUEST_METHOD */
+    str = nxt_unit_sptr_get(&r->method);
+    php_register_variable_safe((char *) "REQUEST_METHOD", str,
+                               r->method_length, track_vars_array TSRMLS_CC);
+
+    /* Register REQUEST_URI */
+    str = nxt_unit_sptr_get(&r->target);
+    php_register_variable_safe((char *) "REQUEST_URI", str,
+                               r->target_length, track_vars_array TSRMLS_CC);
+
+    /* Register QUERY_STRING */
+    str = nxt_unit_sptr_get(&r->query);
+    php_register_variable_safe((char *) "QUERY_STRING", str,
+                               r->query_length, track_vars_array TSRMLS_CC);
+
+    /* Register REMOTE_ADDR */
+    str = nxt_unit_sptr_get(&r->remote);
+    php_register_variable_safe((char *) "REMOTE_ADDR", str,
+                               r->remote_length, track_vars_array TSRMLS_CC);
+
+    /* Register SERVER_ADDR */
+    str = nxt_unit_sptr_get(&r->local_addr);
+    php_register_variable_safe((char *) "SERVER_ADDR", str,
+                               r->local_addr_length, track_vars_array TSRMLS_CC);
+
+    /* Register SERVER_NAME */
+    str = nxt_unit_sptr_get(&r->server_name);
+    php_register_variable_safe((char *) "SERVER_NAME", str,
+                               r->server_name_length, track_vars_array TSRMLS_CC);
+
+    /* Register SERVER_PORT */
+    str = nxt_unit_sptr_get(&r->local_port);
+    php_register_variable_safe((char *) "SERVER_PORT", str,
+                               r->local_port_length, track_vars_array TSRMLS_CC);
+
+    /* Register HTTPS if TLS is enabled */
+    if (r->tls) {
+        php_register_variable_safe((char *) "HTTPS", (char *) "on",
+                                   2, track_vars_array TSRMLS_CC);
+    }
+
+    /* Register HTTP headers */
+    f_end = r->fields + r->fields_count;
+    for (f = r->fields; f < f_end; f++) {
+        name = nxt_unit_sptr_get(&f->name);
+        str = nxt_unit_sptr_get(&f->value);
+        php_register_variable_safe((char *) name, str,
+                                   f->value_length, track_vars_array TSRMLS_CC);
+    }
+
+    /* Register CONTENT_LENGTH */
+    if (r->content_length_field != NXT_UNIT_NONE_FIELD) {
+        f = r->fields + r->content_length_field;
+        str = nxt_unit_sptr_get(&f->value);
+        php_register_variable_safe((char *) "CONTENT_LENGTH", str,
+                                   f->value_length, track_vars_array TSRMLS_CC);
+    }
+
+    /* Register CONTENT_TYPE */
+    if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
+        f = r->fields + r->content_type_field;
+        str = nxt_unit_sptr_get(&f->value);
+        php_register_variable_safe((char *) "CONTENT_TYPE", str,
+                                   f->value_length, track_vars_array TSRMLS_CC);
+    }
+}
+
+
+static void
 nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
     nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
@@ -2340,7 +2462,7 @@ nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
 
     /* Populate $_SERVER */
     if (server_array != NULL) {
-        nxt_php_register_variables(server_array);
+        nxt_php_register_variables_async(ctx->req, ctx, server_array);
     }
 
     /* Populate $_GET - use PARSE_STRING to write into our array */
