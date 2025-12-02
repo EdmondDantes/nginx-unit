@@ -1980,11 +1980,13 @@ nxt_php_request_handler_async(nxt_unit_request_info_t *req)
     zend_async_scope_t    *request_scope;
     zend_coroutine_t      *coroutine;
     nxt_php_run_ctx_t     run_ctx;
+    nxt_php_target_t      *target;
     nxt_unit_request_t    *r;
     nxt_unit_field_t      *f;
     void                  *saved_server_context;
 
     r = req->request;
+    target = &nxt_php_targets[r->app_target];
 
     /* 1. Create new Scope for this request with its own superglobals */
     request_scope = ZEND_ASYNC_NEW_SCOPE(ZEND_ASYNC_CURRENT_SCOPE);
@@ -2004,6 +2006,11 @@ nxt_php_request_handler_async(nxt_unit_request_info_t *req)
     /* Prepare run context */
     nxt_memzero(&run_ctx, sizeof(run_ctx));
     run_ctx.req = req;
+    run_ctx.root = &target->root;
+    run_ctx.index = &target->index;
+    run_ctx.script_filename = target->script_filename;
+    run_ctx.script_dirname = target->script_dirname;
+    run_ctx.script_name = target->script_name;
 
     /* Extract cookie if present */
     if (r->cookie_field != NXT_UNIT_NONE_FIELD) {
@@ -2275,7 +2282,7 @@ nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx)
 static void
 nxt_php_scope_init_superglobals(zend_async_scope_t *scope)
 {
-    zval empty_array;
+    zval tmp;
 
     if (scope->superglobals != NULL) {
         return;
@@ -2284,26 +2291,26 @@ nxt_php_scope_init_superglobals(zend_async_scope_t *scope)
     ALLOC_HASHTABLE(scope->superglobals);
     zend_hash_init(scope->superglobals, 8, NULL, ZVAL_PTR_DTOR, 0);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_GET", sizeof("_GET") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_GET", sizeof("_GET") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_POST", sizeof("_POST") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_POST", sizeof("_POST") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_ENV", sizeof("_ENV") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_ENV", sizeof("_ENV") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_FILES", sizeof("_FILES") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_FILES", sizeof("_FILES") - 1, &tmp);
 
-    array_init(&empty_array);
-    zend_hash_str_add(scope->superglobals, "_REQUEST", sizeof("_REQUEST") - 1, &empty_array);
+    array_init(&tmp);
+    zend_hash_str_add_new(scope->superglobals, "_REQUEST", sizeof("_REQUEST") - 1, &tmp);
 }
 
 
@@ -2313,6 +2320,7 @@ nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
     zval               *server_array, *get_array, *post_array, *cookie_array;
     nxt_php_run_ctx_t  *ctx;
     nxt_unit_request_t *r;
+    nxt_unit_field_t   *f;
 
     if (scope->superglobals == NULL) {
         nxt_php_scope_init_superglobals(scope);
@@ -2330,23 +2338,54 @@ nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
     post_array   = zend_hash_str_find(scope->superglobals, "_POST", sizeof("_POST") - 1);
     cookie_array = zend_hash_str_find(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1);
 
+    /* Populate $_SERVER */
     if (server_array != NULL) {
         nxt_php_register_variables(server_array);
     }
 
+    /* Populate $_GET - use PARSE_STRING to write into our array */
     if (get_array != NULL && r->query_length > 0) {
         char *query = estrndup((char *)nxt_unit_sptr_get(&r->query), r->query_length);
-        php_default_treat_data(PARSE_GET, query, get_array);
+        php_default_treat_data(PARSE_STRING, query, get_array);
     }
 
+    /* Populate $_COOKIE - use PARSE_STRING to write into our array */
     if (cookie_array != NULL && ctx->cookie != NULL) {
         char *cookie = estrdup(ctx->cookie);
-        php_default_treat_data(PARSE_COOKIE, cookie, cookie_array);
+        php_default_treat_data(PARSE_STRING, cookie, cookie_array);
     }
 
+    /* Populate $_POST - use PARSE_STRING for application/x-www-form-urlencoded */
     if (post_array != NULL &&
         SG(request_info).request_method &&
-        !strcasecmp(SG(request_info).request_method, "POST")) {
-        php_default_treat_data(PARSE_POST, NULL, post_array);
+        !strcasecmp(SG(request_info).request_method, "POST"))
+    {
+        /* Check if content type is application/x-www-form-urlencoded */
+        if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
+            f = r->fields + r->content_type_field;
+            const char *content_type = nxt_unit_sptr_get(&f->value);
+
+            /* Only parse if it's form-urlencoded (simple POST data) */
+            if (content_type && 
+                strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0)
+            {
+                /* Read POST body into memory */
+                size_t post_len = r->content_length;
+                if (post_len > 0) {
+                    char *post_data = nxt_malloc(post_len + 1);
+                    if (post_data != NULL) {
+                        size_t read_bytes = nxt_unit_request_read(ctx->req, post_data, post_len);
+                        if (read_bytes > 0) {
+                            post_data[read_bytes] = '\0';
+                            /* php_default_treat_data will modify and free the string, so use estrndup */
+                            char *post_copy = estrndup(post_data, read_bytes);
+                            php_default_treat_data(PARSE_STRING, post_copy, post_array);
+                        }
+                        nxt_free(post_data);
+                    }
+                }
+            }
+            /* For multipart/form-data and others - not supported yet in async mode */
+        }
     }
 }
