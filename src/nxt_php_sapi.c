@@ -953,12 +953,14 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
                                target->root.start, target->root.length))
             {
                 nxt_alert(task, "entrypoint is not under php root");
+                nxt_free(p);
                 return NXT_ERROR;
             }
 
             ret = nxt_php_dirname(&target->script_filename,
                                   &target->script_dirname);
             if (nxt_slow_path(ret != NXT_OK)) {
+                nxt_free(p);
                 return NXT_ERROR;
             }
 
