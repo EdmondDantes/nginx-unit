@@ -823,6 +823,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     static const nxt_str_t  root_str = nxt_string("root");
     static const nxt_str_t  script_str = nxt_string("script");
     static const nxt_str_t  index_str = nxt_string("index");
+    static const nxt_str_t  entrypoint_str = nxt_string("entrypoint");
 
     value = nxt_conf_get_object_member(conf, &root_str, NULL);
 
@@ -901,6 +902,72 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
                                     + target->root.length;
 
     } else {
+        /* Check for entrypoint (async mode) */
+        value = nxt_conf_get_object_member(conf, &entrypoint_str, NULL);
+
+        if (value != NULL) {
+            nxt_conf_get_string(value, &str);
+
+            /* Check if entrypoint is an absolute path */
+            if (str.length > 0 && str.start[0] == '/') {
+                /* Absolute path - use it directly */
+                tmp = nxt_malloc(str.length + 1);
+                if (nxt_slow_path(tmp == NULL)) {
+                    return NXT_ERROR;
+                }
+
+                nxt_memcpy(tmp, str.start, str.length);
+                tmp[str.length] = '\0';
+
+            } else {
+                /* Relative path - prepend root */
+                nxt_php_str_trim_lead(&str, '/');
+
+                tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
+                if (nxt_slow_path(tmp == NULL)) {
+                    return NXT_ERROR;
+                }
+
+                p = tmp;
+
+                p = nxt_cpymem(p, target->root.start, target->root.length);
+                *p++ = '/';
+
+                p = nxt_cpymem(p, str.start, str.length);
+                *p = '\0';
+            }
+
+            p = nxt_realpath(tmp);
+            if (nxt_slow_path(p == NULL)) {
+                nxt_alert(task, "entrypoint realpath(%s) failed %E", tmp, nxt_errno);
+                nxt_free(tmp);
+                return NXT_ERROR;
+            }
+
+            nxt_free(tmp);
+
+            target->script_filename.length = nxt_strlen(p);
+            target->script_filename.start = p;
+
+            if (!nxt_str_start(&target->script_filename,
+                               target->root.start, target->root.length))
+            {
+                nxt_alert(task, "entrypoint is not under php root");
+                return NXT_ERROR;
+            }
+
+            ret = nxt_php_dirname(&target->script_filename,
+                                  &target->script_dirname);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NXT_ERROR;
+            }
+
+            target->script_name.length = target->script_filename.length
+                                         - target->root.length;
+            target->script_name.start = target->script_filename.start
+                                        + target->root.length;
+        }
+
         value = nxt_conf_get_object_member(conf, &index_str, NULL);
 
         if (value != NULL) {
