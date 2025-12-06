@@ -114,6 +114,7 @@ static bool nxt_php_activate_true_async(nxt_task_t *task);
 static void nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx);
 static int nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
 static void nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
+static void nxt_php_quit_handler(nxt_unit_ctx_t *ctx);
 static void nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx);
 static nxt_int_t nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     nxt_conf_value_t *conf);
@@ -757,6 +758,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
         php_init.callbacks.add_port = nxt_php_add_port;
         php_init.callbacks.remove_port = nxt_php_remove_port;
         php_init.callbacks.request_handler = nxt_php_request_handler_async;
+        php_init.callbacks.quit = nxt_php_quit_handler;
         php_init.callbacks.shm_ack_handler = nxt_php_shm_ack_handler;
 
         if (nxt_slow_path(nxt_php_async_load_entrypoint(task, &c->entrypoint) != NXT_OK)) {
@@ -2384,6 +2386,17 @@ nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint)
     /* DON'T call php_request_shutdown() - we want the callback to persist after fork */
 
     return NXT_OK;
+}
+
+
+/* Quit handler for graceful shutdown */
+static void
+nxt_php_quit_handler(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_debug(ctx, "TrueAsync: quit handler called, triggering graceful shutdown");
+
+    /* Call ZEND_ASYNC_SHUTDOWN to trigger graceful shutdown of all coroutines */
+    ZEND_ASYNC_SHUTDOWN();
 }
 
 
