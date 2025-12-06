@@ -108,6 +108,7 @@ typedef void (*zif_handler)(INTERNAL_FUNCTION_PARAMETERS);
 static nxt_int_t nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     nxt_common_app_conf_t *conf);
 static nxt_int_t nxt_php_start(nxt_task_t *task, nxt_process_data_t *data);
+static void nxt_php_cleanup_targets(void);
 static nxt_int_t nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint);
 static bool nxt_php_activate_true_async(nxt_task_t *task);
 static void nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx);
@@ -406,6 +407,7 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
 
 
 static nxt_php_target_t  *nxt_php_targets;
+static nxt_uint_t        nxt_php_targets_count;
 static nxt_int_t         nxt_php_last_target = -1;
 
 /* Global Unit context - needed by nxt_php_extension.c */
@@ -719,6 +721,8 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
         return NXT_ERROR;
     }
 
+    nxt_php_targets_count = n;
+
     if (c->targets != NULL) {
         next = 0;
 
@@ -805,6 +809,9 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     }
     nxt_unit_done(nxt_php_unit_ctx);
 
+    /* Clean up allocated memory before exit */
+    nxt_php_cleanup_targets();
+
     exit(0);
 
     return NXT_OK;
@@ -887,12 +894,14 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
                            target->root.start, target->root.length))
         {
             nxt_alert(task, "script is not under php root");
+            nxt_free(p);
             return NXT_ERROR;
         }
 
         ret = nxt_php_dirname(&target->script_filename,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_free(target->script_filename.start);
             return NXT_ERROR;
         }
 
@@ -975,12 +984,13 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         if (value != NULL) {
             nxt_conf_get_string(value, &str);
 
-            tmp = nxt_malloc(str.length);
+            tmp = nxt_malloc(str.length + 1);
             if (nxt_slow_path(tmp == NULL)) {
                 return NXT_ERROR;
             }
 
             nxt_memcpy(tmp, str.start, str.length);
+            tmp[str.length] = '\0';
 
             target->index.length = str.length;
             target->index.start = tmp;
@@ -991,6 +1001,46 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     }
 
     return NXT_OK;
+}
+
+
+static void
+nxt_php_cleanup_targets(void)
+{
+    nxt_uint_t  i;
+
+    if (nxt_php_targets == NULL) {
+        return;
+    }
+
+    for (i = 0; i < nxt_php_targets_count; i++) {
+        nxt_php_target_t *target = &nxt_php_targets[i];
+
+        /* Free root (allocated by nxt_realpath) */
+        if (target->root.start != NULL) {
+            nxt_free(target->root.start);
+        }
+
+        /* Free script_filename (allocated by nxt_realpath) */
+        if (target->script_filename.start != NULL) {
+            nxt_free(target->script_filename.start);
+        }
+
+        /* Free script_dirname (allocated by nxt_php_dirname) */
+        if (target->script_dirname.start != NULL) {
+            nxt_free(target->script_dirname.start);
+        }
+
+        /* Free index if it's not the default "index.php" constant */
+        if (target->index.start != NULL &&
+            target->index.start != (u_char *)"index.php") {
+            nxt_free(target->index.start);
+        }
+    }
+
+    nxt_free(nxt_php_targets);
+    nxt_php_targets = NULL;
+    nxt_php_targets_count = 0;
 }
 
 
